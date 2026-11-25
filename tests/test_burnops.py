@@ -35,6 +35,8 @@ class BurnBar(object):
             return self.addr
         if off == ffmacro.FUSEDATA:
             return self.data
+        if off == ffmacro.FUSEWDATA:
+            return self.wdata
         return self.reg.get(off, 0)
 
     def wr(self, off, val):
@@ -429,6 +431,149 @@ class TestSafetyHardening(unittest.TestCase):
         targets, _ = analyze.resolve_targets(base)
         self.assertEqual(targets["pcie_magic_gen4_dis"], 0)
         self.assertEqual(targets["disable_gen3_speed_bit1"], 0)
+
+    def test_dead_bus_status_reads_once_and_returns_3(self):
+        reads = []
+
+        def dead_rd(off):
+            reads.append(off)
+            return 0xFFFFFFFF
+
+        logs = []
+        rc = burntool.cmd_status(dead_rd, log=logs.append)
+        self.assertEqual(rc, 3, logs)
+        self.assertEqual(reads, [ffmacro.FUSECTRL])
+
+    def test_capture_alignment_bounds_and_multi_gpu_refusal(self):
+        from ffcalc import capture
+        buf = bytearray(0x100)
+        for bad in (-4, 1, 2, 0x100, 0xFE):
+            with self.assertRaises(ValueError):
+                capture.rd(buf, bad)
+            with self.assertRaises(ValueError):
+                capture.wr(buf, bad, 0)
+
+        # Fake sysfs with two GPUs (20c2 + 2082): omitted --bdf MUST fail; explicit --bdf picks 2082 cleanly
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, True)
+        for bdf, dev in (("0000:05:00.0", "0x20c2"), ("0000:06:00.0", "0x2082")):
+            d = os.path.join(tmp, bdf)
+            os.makedirs(d)
+            with open(os.path.join(d, "vendor"), "w") as f:
+                f.write("0x10de\n")
+            with open(os.path.join(d, "device"), "w") as f:
+                f.write(dev + "\n")
+        with self.assertRaises(SystemExit) as cm:
+            capture.select_device(bdf=None, base=tmp)
+        self.assertIn("multiple NVIDIA GA100 GPUs", str(cm.exception))
+        self.assertEqual(capture.select_device(bdf="0000:06:00.0", base=tmp), ("0000:06:00.0", "0x2082"))
+
+    def test_swapped_card_with_blank_target_row_is_refused(self):
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, True)
+        plan_path = os.path.join(tmp, "plan.json")
+        dump_path = os.path.join(tmp, "dump.json")
+        with open(plan_path, "w") as f:
+            json.dump(PLAN, f)
+        rows = dict(("%d" % r, "0") for r in range(512))
+        rows["8"] = "0x11111111"
+        rows["290"] = "0x429004c1"
+        with open(dump_path, "w") as f:
+            json.dump({"sku": "8gb", "uuid": "GPU-test", "fingerprint": "abc",
+                       "ff_rows": rows,
+                       "option_words": {"fbp_disable": "0x852", "fbp_defective": "0x840"}}, f)
+        # Card B has blank target row 315 AND matching row 290, but DIFFERENT die-ID row 8!
+        bar_b = BurnBar(rows={8: 0x22222222, 290: 0x429004C1})
+        logs = []
+        rc = burntool.cmd_burn(bar_b.rd, bar_b.wr, plan_path, dump_path,
+                               sleep=noop, clock=zero_clock, log=logs.append)
+        self.assertEqual(rc, 1, logs)
+        self.assertTrue(any("WRONG CARD" in m for m in logs), logs)
+        self.assertEqual(bar_b.programs, [])
+
+    def test_simulate_physical_row_order_and_optin_collateral_detection(self):
+        from ffcalc.simulate import simulate
+        # Put an existing record at row 250 for chain1 blk19 = 0x4290, and try to burn
+        # at row 240 (a hole BEFORE row 250!): physical replay must see row 250 win (0x4290),
+        # NOT the earlier row 240!
+        rows = {r: 0 for r in range(512)}
+        rows[250] = 0x429004C1
+        dump = {"sku": "8gb", "ff_rows": rows, "option_words": {}}
+        plan_hole = {
+            "targets": {"fbp_disable": "0x840"},
+            "burn": [{"row": 240, "record": "0x420004c1", "chain": 1, "block": 19,
+                      "old": "0x4290", "new": "0x4200", "fields": ["fbp_disable"]}],
+        }
+        res = simulate(dump, plan_hole)
+        self.assertTrue(any("burned but still != target" in e for e in res["errors"]), res["errors"])
+
+        # Collateral modification of opt-in pcie_devidb MSB (bit 0 of block 2,39) MUST FAIL!
+        rows2 = {r: 0 for r in range(512)}
+        rows2[222] = (0x0782 << 16) | (39 << 6) | 2
+        dump2 = {"sku": "8gb", "ff_rows": rows2, "option_words": {}}
+        bad_new = 0x0581  # clears bit 1 & bit 9, AND flips bit 0 (DEVIDB MSB)!
+        plan_bad_bit0 = {
+            "targets": {"disable_gen3_speed_bit1": "0x0", "disable_gen3_speed_bit9": "0x0"},
+            "burn": [{"row": 223, "record": "0x%08x" % ((bad_new << 16) | (39 << 6) | 2),
+                      "chain": 2, "block": 39, "old": "0x0782", "new": "0x%04x" % bad_new,
+                      "fields": ["disable_gen3_speed_bit1", "disable_gen3_speed_bit9"]}],
+        }
+        res2 = simulate(dump2, plan_bad_bit0)
+        self.assertTrue(any("pcie_devidb: collateral change" in e for e in res2["errors"]), res2["errors"])
+
+    def test_ingest_rejects_ffrow_error_and_cross_card_bar0(self):
+        from ffcalc import ingest
+        with self.assertRaises(ValueError):
+            ingest.parse_log("FFPROBE ffrow_error poison_5 fa820000 badf510e\n")
+        with self.assertRaises(ValueError):
+            ingest.parse_log("FFPROBE ffrows_done fa000000 00000001\n", expected_bar0=0xfa000000)
+        # Card A lines mixed with Card B expected_bar0 MUST be rejected
+        mixed = (
+            "FFPROBE probe_start fa000000 00000001\n"
+            "FFPROBE ffrow.222 f9820008 00000000\n"
+            "FFPROBE probe_end fa000000 00000000\n"
+        )
+        with self.assertRaises(ValueError):
+            ingest.parse_log(mixed, expected_bar0=0xfa000000)
+        # Clean framed log slices out stale earlier lines
+        framed = (
+            "FFPROBE ffrow.222 f9820008 deadbeef\n"
+            "FFPROBE probe_start fa000000 00000001\n"
+            "FFPROBE ffrow.222 fa820008 12345678\n"
+            "FFPROBE ffrows_done fa000000 00000000\n"
+            "FFPROBE probe_end fa000000 00000000\n"
+        )
+        entries = ingest.parse_log(framed, expected_bar0=0xfa000000)
+        self.assertEqual(dict((n, v) for n, _, v in entries)["ffrow.222"], 0x12345678)
+
+    def test_program_row_timeout_performs_zero_extra_reads_after_timeout(self):
+        bar = BurnBar(rows={290: 0x429004C1})
+        ffmacro.arm(bar.rd, bar.wr)
+        reads = []
+        t = [0.0]
+
+        def clock():
+            t[0] += 6.0  # first poll t=6, second check t=12 >= 10s timeout
+            return t[0]
+
+        orig_rd = bar.rd
+        orig_wr = bar.wr
+
+        def spy_rd(off):
+            reads.append(off)
+            return orig_rd(off)
+
+        def stall_wr(off, val):
+            orig_wr(off, val)
+            if off == ffmacro.FUSECTRL and val == ffmacro.CMD_PROGRAM:
+                bar.ctrl = 0xE00C0000  # busy forever
+
+        with self.assertRaises(ffmacro.FuseControllerError) as cm:
+            ffmacro.program_row(spy_rd, stall_wr, 315, 0x420004C1, sleep=noop, clock=clock)
+        self.assertIn("0xe00c0000", str(cm.exception))
+        # Exactly ONE poll read of FUSECTRL after CMD_PROGRAM (no extra rd(FUSECTRL) for formatting!)
+        last_wdata_idx = len(reads) - 1 - reads[::-1].index(ffmacro.FUSEWDATA)
+        self.assertEqual(reads[last_wdata_idx + 1:], [ffmacro.FUSECTRL])
 
 
 if __name__ == "__main__":

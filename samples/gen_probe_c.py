@@ -57,13 +57,15 @@ static int __init ffprobe_init(void)
 	h = ioremap(bar0, 0x00830000);
 	if (!h)
 		return -ENOMEM;
+	pr_info("FFPROBE probe_start %08llx 00000001\\n", (u64)bar0);
 	for (i = 0; i < ARRAY_SIZE(entries); i++)
 		pr_info("FFPROBE %s %08llx %08x\\n", entries[i].name,
 			(u64)bar0 + entries[i].off,
 			readl(h + entries[i].off));
 	if (ffrows)
-		pr_info("FFPROBE ffrows_done 00000000 %08x\\n",
+		pr_info("FFPROBE ffrows_done %08llx %08x\\n", (u64)bar0,
 			ffprobe_read_rows(h) ? 1 : 0);
+	pr_info("FFPROBE probe_end %08llx 00000000\\n", (u64)bar0);
 	iounmap(h);
 	return -EAGAIN;
 }

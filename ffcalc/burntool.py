@@ -55,8 +55,9 @@ def cmd_status(rd, log=print):
     st = ffmacro.status(rd)
     for name in sorted(st):
         log("%-16s 0x%08x" % (name, st[name]))
-    if ffmacro.is_poisoned(st["FUSECTRL"]):
-        log("=> POISONED: stop reads, cold-boot the card")
+    fault = ffmacro.status_fault(st)
+    if fault is not None:
+        log("=> FAULT (%s): stop reads, cold-boot the card" % fault)
         return 3
     log("=> write window: %s" % ("OPEN" if ffmacro.in_write_window(st)
                                  else "closed"))
@@ -117,9 +118,9 @@ def cmd_burn(rd, wr, plan_path, dump_path, rows=None, log=print,
         kw["clock"] = clock
 
     st = ffmacro.status(rd)
-    if ffmacro.is_poisoned(st["FUSECTRL"]):
-        log("REFUSED: controller poisoned (FUSECTRL=0x%08x); cold-boot first"
-            % st["FUSECTRL"])
+    fault = ffmacro.status_fault(st)
+    if fault is not None:
+        log("REFUSED: controller fault (%s); cold-boot first" % fault)
         return 3
     if not force and not ffmacro.in_write_window(st):
         why = []
@@ -147,6 +148,22 @@ def cmd_burn(rd, wr, plan_path, dump_path, rows=None, log=print,
             if missing:
                 log("REFUSED: dump does not cover rows %s" % sorted(missing))
                 return 1
+            # Identity verification: re-read die-ID rows 8..15 (when present in dump)
+            # AND every occupied baseline FF row in dump so a swapped card whose
+            # target rows also happen to be blank can NEVER pass!
+            planned_rows = {rec["row"] for rec in plan["burn"]}
+            identity_rows = sorted(
+                {r for r in range(8, 16) if r in dump["ff_rows"]}
+                | {r for r, v in dump["ff_rows"].items() if v != 0 and r not in planned_rows}
+            )
+            for id_row in identity_rows:
+                live = ffmacro.read_row(rd, wr, id_row, **kw)
+                snap = dump["ff_rows"][id_row]
+                if live != snap:
+                    log("REFUSED: card identity/baseline row %d differs "
+                        "(snapshot 0x%08x, live 0x%08x) -- WRONG CARD or stale dump"
+                        % (id_row, snap, live))
+                    return 1
             for rec in plan["burn"]:
                 live = ffmacro.read_row(rd, wr, rec["row"], **kw)
                 snap = dump["ff_rows"].get(rec["row"])
@@ -161,8 +178,8 @@ def cmd_burn(rd, wr, plan_path, dump_path, rows=None, log=print,
                     "(snapshot 0x%08x, live 0x%08x) -- regenerate the plan"
                     % (rec["row"], snap, live))
                 return 1
-            log("snapshot matches card (%d rows re-read, %d already burned)"
-                % (len(plan["burn"]), len(already)))
+            log("snapshot matches card (%d identity/baseline + %d target rows re-read, %d already burned)"
+                % (len(identity_rows), len(plan["burn"]), len(already)))
 
         log("arm (SBFE shadow + WDATA_WR_SECURE) ...")
         ffmacro.arm(rd, wr)
@@ -186,6 +203,12 @@ def cmd_burn(rd, wr, plan_path, dump_path, rows=None, log=print,
             "then re-check with `status` (docs/BURNING.md)")
         return 3
     st = ffmacro.status(rd)
+    post_fault = ffmacro.status_fault(st)
+    if post_fault is not None or not ffmacro.is_idle(st["FUSECTRL"]) or st["CRC_STATUS"] != 0x55 or st["FUSEDEBUG"] != 0:
+        log("POST-BURN FAULT: %s (FUSECTRL=0x%08x CRC=0x%x FUSEDEBUG=0x%x) -- STOP and cold-boot"
+            % (post_fault or "abnormal post-burn controller state",
+               st.get("FUSECTRL", 0), st.get("CRC_STATUS", 0), st.get("FUSEDEBUG", 0)))
+        return 3
     log("post: FUSECTRL=0x%08x FUSEDEBUG=0x%x CRC=0x%x DSOV=%d"
         % (st["FUSECTRL"], st["FUSEDEBUG"], st["CRC_STATUS"],
            st["DSOV_STATUS"]))

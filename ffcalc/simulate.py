@@ -50,6 +50,9 @@ def simulate(dump, plan_obj):
     merged = dict(dump["ff_rows"])
     for rec in plan_obj["burn"]:
         merged[rec["row"]] = int(rec["record"], 0)
+    # Replay merged rows in physical row order (matching cold-boot hardware order!),
+    # not JSON list order.
+    after = replay_blocks({"ff_rows": merged})
 
     def decode(blocks):
         return {f.key: decode_field(blocks, f) for f in FIELDS}
@@ -82,14 +85,28 @@ def simulate(dump, plan_obj):
                 else:
                     pending.append(f.key)
 
+    # Check collateral changes on ALL fields (including opt-in / device-ID fields!)
+    # at bit granularity: any bit changed outside the bit positions owned by
+    # burned_keys | targets is reported as a collateral error.
+    auth_bits = set()
+    for key in burned_keys | set(targets):
+        fld = BY_KEY.get(key)
+        if fld is not None:
+            for bit_pos in range(fld.bit, fld.bit + fld.width):
+                auth_bits.add((fld.chain, bit_pos))
     for f in FIELDS:
-        if f.opt_in:
-            continue
         if f.key in burned_keys or f.key in targets:
             continue
-        if cur.get(f.key, 0) != new.get(f.key, 0):
-            errors.append("%s: collateral change 0x%x -> 0x%x"
-                          % (f.key, cur[f.key], new[f.key]))
+        diff = cur.get(f.key, 0) ^ new.get(f.key, 0)
+        if not diff:
+            continue
+        unauth = 0
+        for i in range(f.width):
+            if ((diff >> i) & 1) and (f.chain, f.bit + i) not in auth_bits:
+                unauth |= (1 << i)
+        if unauth:
+            errors.append("%s: collateral change 0x%x -> 0x%x (unauthorized bits 0x%x)"
+                          % (f.key, cur[f.key], new[f.key], unauth))
 
     free_after = len(free) - len(plan_obj["burn"])
     if free_after < 0:

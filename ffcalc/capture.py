@@ -5,13 +5,12 @@ The word capture is strictly read-only: pure reads against BAR0 via
 /sys/.../resource0. Address table is vendored at
 ffcalc/data/ga100-fuses.json.
 
---read-ff-rows additionally captures all 512 physical rows through the
-fuse macro's CMD_READ mechanism (ffcalc/ffmacro.py, procedure from
-kate-land/ga100vfi). CMD_READ is a command WRITE (FUSEADDR + FUSECTRL),
-so run it on an idle card; it is skipped on a bare capture. If you read
-the rows with another setup instead, pass the file with --ffrows. Without
-FF records in the dump, ffcalc refuses to emit or verify a burn plan (see
-ffcalc mergeff).
+Hardened safety guarantees:
+  - Supports 8GB (0x20c2), 10GB (0x2082), and converted A100 (0x20b5) GA100 GPUs.
+  - Refuses to auto-pick a GPU when >1 candidate is present (pass --bdf).
+  - Validates --sku against the actual PCI device ID (no mislabeling 20c2 as 10gb).
+  - Single aligned 32-bit BAR0 reads/writes with strict alignment and bounds checks.
+  - --read-ff-rows aborts on controller fault instead of saving a half-broken dump.
 
 Run on the card's host as root:
     python3 -m ffcalc.capture --bdf 0000:05:00.0 --sku 8gb \
@@ -31,18 +30,17 @@ from . import ffmacro, ffrows
 from .optionmap import A100_DEVID, CMP_DEVID
 
 BAR0_LEN = 0x1000000
+CMP_10GB_DEVID = 0x2082
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_MAP = os.path.join(_HERE, "data", "ga100-fuses.json")
 
-# Same GA100 die and the same fuse map, before and after a --a100 conversion:
-# burning the fused device id to 0x20b5 changes what the card calls itself,
-# not what it is, so capture and burn have to keep finding it either way.
-DEVICE_IDS = tuple("0x%04x" % v for v in (CMP_DEVID, A100_DEVID))
+# Supported GA100 PCI device IDs (8GB CMP 170HX, 10GB CMP 170HX, A100 PCIe 80GB).
+DEVICE_IDS = tuple("0x%04x" % v for v in (CMP_DEVID, CMP_10GB_DEVID, A100_DEVID))
 
 
-def open_bar0(bdf=None):
-    base = "/sys/bus/pci/devices"
+def _scan_devices(base="/sys/bus/pci/devices"):
+    """Return sorted list of (bdf, dev_id_str) for supported NVIDIA GA100 devices."""
     cands = []
     for dev in sorted(os.listdir(base)):
         venp = os.path.join(base, dev, "vendor")
@@ -56,43 +54,60 @@ def open_bar0(bdf=None):
             continue
         if ven_id != "0x10de" or dev_id not in DEVICE_IDS:
             continue
-        cands.append(dev)
+        cands.append((dev, dev_id))
+    return cands
+
+
+def select_device(bdf=None, base="/sys/bus/pci/devices"):
+    """Select exactly one supported GA100 device; refuse ambiguity when >1 GPU exists."""
+    cands = _scan_devices(base=base)
     if bdf:
         want = bdf if len(bdf.split(":")) == 3 else "0000:" + bdf
-        cands = [c for c in cands if c == want]
+        cands = [c for c in cands if c[0] == want]
         if not cands:
             raise SystemExit("device %s is not a supported NVIDIA GA100 (%s)"
                              % (want, " or ".join(DEVICE_IDS)))
     if not cands:
         raise SystemExit("no device %s found" % " or ".join(DEVICE_IDS))
-    path = os.path.join(base, cands[0], "resource0")
-    # Same access pattern cmpunlocker uses against a live nvidia driver:
-    # fd opened O_RDWR, mapping ACCESS_WRITE. Word capture reads only;
-    # --read-ff-rows writes just FUSEADDR/FUSECTRL (CMD_READ command).
-    fd = os.open(path, os.O_SYNC | os.O_RDWR)
+    if len(cands) > 1:
+        raise SystemExit("multiple NVIDIA GA100 GPUs found (%s); pass --bdf explicitly"
+                         % ", ".join(b for b, _ in cands))
+    return cands[0]
+
+
+def open_bar0(bdf=None, read_only=False):
+    base = "/sys/bus/pci/devices"
+    chosen_bdf, _dev_id = select_device(bdf=bdf, base=base)
+    path = os.path.join(base, chosen_bdf, "resource0")
+    flags = os.O_RDONLY if read_only else (os.O_SYNC | os.O_RDWR)
+    access = mmap.ACCESS_READ if read_only else mmap.ACCESS_WRITE
+    fd = os.open(path, flags)
     try:
         length = os.path.getsize(path) or BAR0_LEN
-        mm = mmap.mmap(fd, length, access=mmap.ACCESS_WRITE)
+        mm = mmap.mmap(fd, length, access=access)
     finally:
         os.close(fd)
-    return cands[0], mm
+    return chosen_bdf, mm
 
 
 def _off(addr):
-    """BAR0 offset as an int, from either address style we pass around.
-
-    The JSON map stores hex strings ("0x0082036c"); ffmacro hands us plain
-    ints (PMC_BOOT_0, FUSECTRL, ...). int(addr, 0) alone raises TypeError on
-    an int under Python 3 ("int() can't convert non-string with explicit
-    base"), which would kill every fuse macro command before the first read.
-    """
+    """BAR0 offset as an int, from either address style we pass around."""
     if isinstance(addr, str):
         return int(addr, 0)
     return operator.index(addr)
 
 
+def _check_aligned_bounds(mm, off):
+    if isinstance(off, bool) or (off & 3) != 0 or off < 0:
+        raise ValueError("unaligned or negative BAR0 offset: 0x%x" % off)
+    if isinstance(mm, (mmap.mmap, bytearray, memoryview)):
+        if off + 4 > len(mm):
+            raise ValueError("BAR0 offset 0x%x out of bounds (len=0x%x)" % (off, len(mm)))
+
+
 def rd(mm, addr):
     off = _off(addr)
+    _check_aligned_bounds(mm, off)
     if isinstance(mm, (mmap.mmap, bytearray, memoryview)):
         mv = memoryview(mm)[off:off + 4].cast("I")
         try:
@@ -105,7 +120,10 @@ def rd(mm, addr):
 
 def wr(mm, addr, value):
     off = _off(addr)
-    val = value & 0xffffffff
+    _check_aligned_bounds(mm, off)
+    if not isinstance(value, int) or isinstance(value, bool):
+        raise ValueError("BAR0 write value must be an int: %r" % (value,))
+    val = value & 0xFFFFFFFF
     if isinstance(mm, (mmap.mmap, bytearray, memoryview)):
         mv = memoryview(mm)[off:off + 4].cast("I")
         try:
@@ -121,7 +139,8 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--bdf")
     ap.add_argument("--map", default=DEFAULT_MAP)
-    ap.add_argument("--sku", default="8gb", choices=("8gb", "10gb"))
+    ap.add_argument("--sku", default=None, choices=("8gb", "10gb"),
+                    help="SKU label (auto-derived from PCI device ID when omitted; validated when given)")
     ap.add_argument("-o", "--out", default="dump.json")
     ap.add_argument("--ffrows", metavar="FILE",
                     help="FF rows file read out elsewhere; merged into the "
@@ -138,8 +157,19 @@ def main():
     except ValueError as e:
         raise SystemExit("bad option map %s: %s" % (args.map, e))
 
-    bdf, mm = open_bar0(args.bdf)
+    chosen_bdf, dev_id = select_device(args.bdf)
+    inferred_sku = "10gb" if dev_id == ("0x%04x" % CMP_10GB_DEVID) else "8gb"
+    if args.sku is not None and dev_id != ("0x%04x" % A100_DEVID) and args.sku != inferred_sku:
+        raise SystemExit("SKU mismatch: --sku %s does not match PCI device %s (%s -> %s)"
+                         % (args.sku, chosen_bdf, dev_id, inferred_sku))
+    sku = args.sku or inferred_sku
+
+    bdf, mm = open_bar0(chosen_bdf, read_only=(not args.read_ff_rows))
     try:
+        # Fail-fast health gate before reading option map.
+        ctrl = rd(mm, ffmacro.FUSECTRL)
+        if ffmacro.is_poisoned(ctrl) or ffmacro.is_dead(ctrl):
+            raise SystemExit("ABORT: FUSECTRL=0x%08x (poisoned/dead BAR0; stopped immediately)" % ctrl)
         words = {}
         for key, loc in m["fields"].items():
             fused = rd(mm, loc["fused"]) if loc.get("fused") else None
@@ -173,18 +203,14 @@ def main():
                 ffmacro.capture_rows(lambda a: rd(mm, a),
                                      lambda a, v: wr(mm, a, v), rows=ff_rows)
             except ffmacro.FuseControllerError as e:
-                print("WARN: CMD_READ pass aborted: %s" % e)
-                print("WARN: keeping the %d row(s) read so far" % len(ff_rows))
+                raise SystemExit("ABORT: CMD_READ pass failed after %d row(s): %s"
+                                 % (len(ff_rows), e))
     finally:
         mm.close()
-    dump = {"sku": args.sku, "bdf": bdf, "ff_rows": ff_rows,
+    dump = {"sku": sku, "bdf": bdf, "pci_device": dev_id, "ff_rows": ff_rows,
             "option_words": words, "info": info,
             "read_only": not wrote_rows}
     try:
-        # One codec for every snapshot on disk: values checked, rows written
-        # as fixed-width "0x%08x", file renamed into place only after it has
-        # been read back -- a capture is the evidence a plan is built from,
-        # it must not be half-written by an interrupted run.
         dump = snapshot.to_json_form(dump, args.out)
         snapshot.atomic_write_json(args.out, dump)
     except snapshot.BadSnapshot as e:
@@ -194,7 +220,7 @@ def main():
         print("note: FF rows %s (%d of %d unknown); ffcalc will not emit a "
               "burn plan until a full readout is merged (ffcalc mergeff)"
               % (state, len(missing), ffrows.N_FF_ROWS))
-    print("wrote %s (%s)" % (args.out, bdf))
+    print("wrote %s (%s, sku=%s)" % (args.out, bdf, sku))
 
 
 if __name__ == "__main__":

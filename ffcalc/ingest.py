@@ -20,6 +20,7 @@ import re
 from . import dump as snapshot
 
 LINE = re.compile(r"FFPROBE (\S+) ([0-9a-fA-F]+) ([0-9a-fA-F]+)")
+ERR_LINE = re.compile(r"FFPROBE ffrow_error\b(.*)")
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_MAP = os.path.join(_HERE, "data", "ga100-fuses.json")
@@ -34,18 +35,57 @@ def sanitize(bdf):
     return re.sub(r"[.:]", "_", bdf)
 
 
-def parse_log(text):
-    """FFPROBE log text -> list of (name, addr, value), later lines win."""
-    out = {}
-    order = []
+def parse_log(text, expected_bar0=None):
+    """FFPROBE log text -> list of (name, addr, value).
+
+    Hardened framing & integrity checks:
+      - If probe_start/probe_end markers are present, extracts ONLY the final
+        framed session (preventing stale dmesg lines from an earlier card from
+        bleeding in) and verifies probe_end status == 0.
+      - Rejects ANY ffrow_error entry or nonzero ffrows_done status.
+      - When expected_bar0 is provided, verifies every non-zero register
+        address falls inside [expected_bar0, expected_bar0 + 0x1000000) so
+        another card's BAR0 lines can never be ingested under this card's UUID.
+    """
+    parsed = []
     for line in text.splitlines():
+        em = ERR_LINE.search(line)
+        if em:
+            parsed.append(("ffrow_error", 0, em.group(1).strip()))
+            continue
         m = LINE.search(line)
         if not m:
             continue
-        name = m.group(1)
+        parsed.append((m.group(1), int(m.group(2), 16), int(m.group(3), 16)))
+
+    # If framed with probe_start, slice from the last probe_start for expected_bar0 (or last overall).
+    starts = [i for i, (n, a, _) in enumerate(parsed)
+              if n == "probe_start" and (expected_bar0 is None or a == expected_bar0)]
+    if starts:
+        parsed = parsed[starts[-1]:]
+        ends = [i for i, (n, a, _) in enumerate(parsed)
+                if n == "probe_end" and (expected_bar0 is None or a == expected_bar0)]
+        if not ends:
+            raise ValueError("incomplete FFPROBE session: missing probe_end marker")
+        end_idx = ends[0]
+        if parsed[end_idx][2] != 0:
+            raise ValueError("FFPROBE session reported failure status 0x%x" % parsed[end_idx][2])
+        parsed = parsed[1:end_idx]
+
+    out = {}
+    order = []
+    for name, addr, val in parsed:
+        if name == "ffrow_error":
+            raise ValueError("FFPROBE reported row read error (%s); refusing capture" % (val,))
+        if name == "ffrows_done" and val != 0:
+            raise ValueError("FFPROBE ffrows_done=%d (nonzero); refusing partial/failed capture" % val)
+        if expected_bar0 is not None and addr != 0:
+            if not (expected_bar0 <= addr < expected_bar0 + 0x1000000):
+                raise ValueError("FFPROBE line %s has addr 0x%x outside expected BAR0 0x%x (cross-card mixup)"
+                                 % (name, addr, expected_bar0))
         if name not in out:
             order.append(name)
-        out[name] = (int(m.group(2), 16), int(m.group(3), 16))
+        out[name] = (addr, val)
     return [(n, out[n][0], out[n][1]) for n in order]
 
 
@@ -117,7 +157,8 @@ def read_collected(dirpath, m=None, sku="8gb"):
             if not os.path.exists(log):
                 continue
             with io.open(log, encoding="utf-8", errors="replace") as lf:
-                entries = parse_log(lf.read())
+                exp_bar0 = int(bar0, 16) if bar0 else None
+                entries = parse_log(lf.read(), expected_bar0=exp_bar0)
             dump = build_dump(m, entries, sku=sku, bdf=bdf, uuid=uuid,
                               source="ffprobe.ko@%s" % bar0)
             yield dump

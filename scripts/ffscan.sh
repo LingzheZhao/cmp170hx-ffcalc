@@ -76,8 +76,21 @@ for dev in /sys/bus/pci/devices/*; do
 	bdf=$(basename "$dev")
 	bar0=$(head -1 "$dev/resource" | cut -d' ' -f1)
 	uuid=$(awk -F, -v b="$bdf" 'tolower($1)==b {print $2; exit}' "$DIR/uuid.csv")
-	sudo insmod "$KDIR/ffprobe.ko" bar0="$bar0" ffrows="$FFROWS" || true
-	sudo dmesg | grep FFPROBE | tail -n "$N" > "$DIR/probe_${bdf//[:.]/_}.txt"
+	before_lines=$(sudo dmesg | grep -c FFPROBE || true)
+	# ffprobe_init intentionally returns -EAGAIN to auto-unload; verify actual probe output below.
+	sudo insmod "$KDIR/ffprobe.ko" bar0="$bar0" ffrows="$FFROWS" 2>/dev/null || true
+	out_file="$DIR/probe_${bdf//[:.]/_}.txt"
+	sudo dmesg | grep FFPROBE | tail -n +$((before_lines + 1)) > "$out_file"
+	if ! grep -q "FFPROBE probe_start" "$out_file" || ! grep -q "FFPROBE probe_end" "$out_file"; then
+		echo "ERROR: $bdf ($bar0) probe did not complete cleanly; quarantining $out_file.bad" >&2
+		mv "$out_file" "$out_file.bad"
+		exit 1
+	fi
+	if grep -q "FFPROBE ffrow_error" "$out_file"; then
+		echo "ERROR: $bdf ($bar0) reported ffrow_error; quarantining $out_file.bad" >&2
+		mv "$out_file" "$out_file.bad"
+		exit 1
+	fi
 	printf '%s\t%s\t%s\n' "$bdf" "$bar0" "$uuid" >> "$DIR/bar0map.tsv"
 done
 SCAN_FLAGS=""

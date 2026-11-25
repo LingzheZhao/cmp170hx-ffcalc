@@ -862,9 +862,9 @@ class TestIngest(unittest.TestCase):
         d = {"uuid": None, "fingerprint": "deadbeef00000000"}
         self.assertEqual(ingest.card_id(d), "fp-deadbeef00000000")
 
-    def _ffrow_lines(self):
-        return ["[ 1569.9] FFPROBE ffrow.%d 08200008 %08x"
-                % (r, 0x0fe805c1 if r == 222 else 0) for r in range(512)]
+    def _ffrow_lines(self, bar=0x08000000):
+        return ["[ 1569.9] FFPROBE ffrow.%d %08x %08x"
+                % (r, bar + 0x00820008, 0x0fe805c1 if r == 222 else 0) for r in range(512)]
 
     def test_cmd_read_log_fills_ff_rows(self):
         m = ingest.load_map()
@@ -878,11 +878,11 @@ class TestIngest(unittest.TestCase):
         out = tempfile.mkdtemp(prefix="ffcalc-out-")
         self.addCleanup(shutil.rmtree, out, True)
         d = self._collect_dir()
-        for _bdf, _uuid in UUIDS.values():
+        for bar, (_bdf, _uuid) in UUIDS.items():
             path = os.path.join(
                 d, "probe_%s.txt" % ingest.sanitize(_bdf))
             with open(path, "a") as f:
-                f.write("\n" + "\n".join(self._ffrow_lines()))
+                f.write("\n" + "\n".join(self._ffrow_lines(bar)))
         self.assertEqual(
             cli.main(["scan", "--dir", d,
                       "--outdir", os.path.join(out, "cards"),
@@ -906,10 +906,10 @@ class TestIngest(unittest.TestCase):
         out = tempfile.mkdtemp(prefix="ffcalc-out-")
         self.addCleanup(shutil.rmtree, out, True)
         d = self._collect_dir()
-        for _bdf, _uuid in UUIDS.values():
+        for bar, (_bdf, _uuid) in UUIDS.items():
             path = os.path.join(d, "probe_%s.txt" % ingest.sanitize(_bdf))
             with open(path, "a") as f:
-                f.write("\n" + "\n".join(self._ffrow_lines()))
+                f.write("\n" + "\n".join(self._ffrow_lines(bar)))
         first = list(UUIDS.values())[0][1][4:]
 
         def scan(tag, extra):
