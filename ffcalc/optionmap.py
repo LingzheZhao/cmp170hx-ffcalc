@@ -1,7 +1,7 @@
 from dataclasses import dataclass
 
 FF_ROW_MIN = 222
-FF_ROW_MAX = 486
+FF_ROW_MAX = 487
 # Physical fuse array: every row a snapshot or a rows file may name.
 PHYS_ROW_MIN = 0
 PHYS_ROW_MAX = 511

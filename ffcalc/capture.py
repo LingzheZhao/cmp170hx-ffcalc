@@ -45,18 +45,24 @@ def open_bar0(bdf=None):
     base = "/sys/bus/pci/devices"
     cands = []
     for dev in sorted(os.listdir(base)):
+        venp = os.path.join(base, dev, "vendor")
         vp = os.path.join(base, dev, "device")
         try:
+            with io.open(venp) as f:
+                ven_id = f.read().strip().lower()
             with io.open(vp) as f:
-                dev_id = f.read().strip()
+                dev_id = f.read().strip().lower()
         except IOError:
             continue
-        if dev_id not in DEVICE_IDS:
+        if ven_id != "0x10de" or dev_id not in DEVICE_IDS:
             continue
         cands.append(dev)
     if bdf:
         want = bdf if len(bdf.split(":")) == 3 else "0000:" + bdf
-        cands = [c for c in cands if c == want] or [want]
+        cands = [c for c in cands if c == want]
+        if not cands:
+            raise SystemExit("device %s is not a supported NVIDIA GA100 (%s)"
+                             % (want, " or ".join(DEVICE_IDS)))
     if not cands:
         raise SystemExit("no device %s found" % " or ".join(DEVICE_IDS))
     path = os.path.join(base, cands[0], "resource0")
@@ -86,13 +92,29 @@ def _off(addr):
 
 
 def rd(mm, addr):
-    mm.seek(_off(addr))
+    off = _off(addr)
+    if isinstance(mm, (mmap.mmap, bytearray, memoryview)):
+        mv = memoryview(mm)[off:off + 4].cast("I")
+        try:
+            return int(mv[0])
+        finally:
+            mv.release()
+    mm.seek(off)
     return struct.unpack("<I", mm.read(4))[0]
 
 
 def wr(mm, addr, value):
-    mm.seek(_off(addr))
-    mm.write(struct.pack("<I", value & 0xffffffff))
+    off = _off(addr)
+    val = value & 0xffffffff
+    if isinstance(mm, (mmap.mmap, bytearray, memoryview)):
+        mv = memoryview(mm)[off:off + 4].cast("I")
+        try:
+            mv[0] = val
+        finally:
+            mv.release()
+        return
+    mm.seek(off)
+    mm.write(struct.pack("<I", val))
 
 
 def main():
@@ -117,41 +139,44 @@ def main():
         raise SystemExit("bad option map %s: %s" % (args.map, e))
 
     bdf, mm = open_bar0(args.bdf)
-    words = {}
-    for key, loc in m["fields"].items():
-        fused = rd(mm, loc["fused"]) if loc.get("fused") else None
-        status = rd(mm, loc["status"]) if loc.get("status") else None
-        cur = status if status is not None else fused
-        words[key] = "0x%x" % cur
-        if fused is not None and status is not None and fused != status:
-            words[key + "__fused"] = "0x%x" % fused
+    try:
+        words = {}
+        for key, loc in m["fields"].items():
+            fused = rd(mm, loc["fused"]) if loc.get("fused") else None
+            status = rd(mm, loc["status"]) if loc.get("status") else None
+            cur = status if status is not None else fused
+            words[key] = "0x%x" % cur
+            if fused is not None and status is not None and fused != status:
+                words[key + "__fused"] = "0x%x" % fused
 
-    for key, spec in m["bit_fields"].items():
-        w = rd(mm, spec["reg"])
-        words[key] = "0x%x" % ((w >> spec["bit"]) & 1)
+        for key, spec in m["bit_fields"].items():
+            w = rd(mm, spec["reg"])
+            words[key] = "0x%x" % ((w >> spec["bit"]) & 1)
 
-    for key, addr in m["defective"].items():
-        words[key] = "0x%x" % rd(mm, addr)
+        for key, addr in m["defective"].items():
+            words[key] = "0x%x" % rd(mm, addr)
 
-    info = {}
-    for name, addr in m["info"].items():
-        info[name] = "0x%x" % rd(mm, addr)
+        info = {}
+        for name, addr in m["info"].items():
+            info[name] = "0x%x" % rd(mm, addr)
 
-    ff_rows = {}
-    if args.ffrows:
-        try:
-            rows = ffrows.parse_file(args.ffrows)
-        except ValueError as e:
-            raise SystemExit("bad FF rows file %s: %s" % (args.ffrows, e))
-        ff_rows.update((r, v) for r, v in rows.items())
-    wrote_rows = bool(args.read_ff_rows)
-    if args.read_ff_rows:
-        try:
-            ffmacro.capture_rows(lambda a: rd(mm, a),
-                                 lambda a, v: wr(mm, a, v), rows=ff_rows)
-        except ffmacro.FuseControllerError as e:
-            print("WARN: CMD_READ pass aborted: %s" % e)
-            print("WARN: keeping the %d row(s) read so far" % len(ff_rows))
+        ff_rows = {}
+        if args.ffrows:
+            try:
+                rows = ffrows.parse_file(args.ffrows)
+            except ValueError as e:
+                raise SystemExit("bad FF rows file %s: %s" % (args.ffrows, e))
+            ff_rows.update((r, v) for r, v in rows.items())
+        wrote_rows = bool(args.read_ff_rows)
+        if args.read_ff_rows:
+            try:
+                ffmacro.capture_rows(lambda a: rd(mm, a),
+                                     lambda a, v: wr(mm, a, v), rows=ff_rows)
+            except ffmacro.FuseControllerError as e:
+                print("WARN: CMD_READ pass aborted: %s" % e)
+                print("WARN: keeping the %d row(s) read so far" % len(ff_rows))
+    finally:
+        mm.close()
     dump = {"sku": args.sku, "bdf": bdf, "ff_rows": ff_rows,
             "option_words": words, "info": info,
             "read_only": not wrote_rows}

@@ -122,38 +122,48 @@ def cmd_burn(rd, wr, plan_path, dump_path, rows=None, log=print,
             % st["FUSECTRL"])
         return 3
     if not force and not ffmacro.in_write_window(st):
-        log("REFUSED: not in write window: %s"
-            % (ffmacro.armed_problems(rd, wr) or "idle/CRC/EFP/DSOV check"))
+        why = []
+        if not ffmacro.is_idle(st["FUSECTRL"]):
+            why.append("FUSECTRL=0x%08x not idle" % st["FUSECTRL"])
+        if st["FUSEDEBUG"] != 0:
+            why.append("FUSEDEBUG=0x%x" % st["FUSEDEBUG"])
+        if st["CRC_STATUS"] != 0x55:
+            why.append("CRC_STATUS=0x%x" % st["CRC_STATUS"])
+        if st["EFP_STATUS"] != 1:
+            why.append("EFP_STATUS=%d" % st["EFP_STATUS"])
+        if st["DSOV_STATUS"] != 0:
+            why.append("DSOV=%d" % st["DSOV_STATUS"])
+        log("REFUSED: not in write window: %s" % ("; ".join(why) or "window check failed"))
         return 1
 
-    log("CMD_SENSE ...")
-    ffmacro.sense(rd, wr, **kw)
-    log("CMD_SENSE ok (DSOV=0, inside window)")
-    already = set()
-    if not force:
-        missing = {rec["row"] for rec in plan["burn"]} - \
-                  {r for r in dump["ff_rows"]}
-        if missing:
-            log("REFUSED: dump does not cover rows %s" % sorted(missing))
-            return 1
-        for rec in plan["burn"]:
-            live = ffmacro.read_row(rd, wr, rec["row"], **kw)
-            snap = dump["ff_rows"].get(rec["row"])
-            if live == snap:
-                continue
-            if live == int(rec["record"], 0):
-                log("row %d already holds this record; will skip "
-                    "(interrupted run? resuming is safe)" % rec["row"])
-                already.add(rec["row"])
-                continue
-            log("REFUSED: row %d changed since snapshot "
-                "(snapshot 0x%08x, live 0x%08x) -- regenerate the plan"
-                % (rec["row"], snap, live))
-            return 1
-        log("snapshot matches card (%d rows re-read, %d already burned)"
-            % (len(plan["burn"]), len(already)))
-
     try:
+        log("CMD_SENSE ...")
+        ffmacro.sense(rd, wr, **kw)
+        log("CMD_SENSE ok (DSOV=0, inside window)")
+        already = set()
+        if not force:
+            missing = {rec["row"] for rec in plan["burn"]} - \
+                      {r for r in dump["ff_rows"]}
+            if missing:
+                log("REFUSED: dump does not cover rows %s" % sorted(missing))
+                return 1
+            for rec in plan["burn"]:
+                live = ffmacro.read_row(rd, wr, rec["row"], **kw)
+                snap = dump["ff_rows"].get(rec["row"])
+                if live == snap:
+                    continue
+                if live == int(rec["record"], 0):
+                    log("row %d already holds this record; will skip "
+                        "(interrupted run? resuming is safe)" % rec["row"])
+                    already.add(rec["row"])
+                    continue
+                log("REFUSED: row %d changed since snapshot "
+                    "(snapshot 0x%08x, live 0x%08x) -- regenerate the plan"
+                    % (rec["row"], snap, live))
+                return 1
+            log("snapshot matches card (%d rows re-read, %d already burned)"
+                % (len(plan["burn"]), len(already)))
+
         log("arm (SBFE shadow + WDATA_WR_SECURE) ...")
         ffmacro.arm(rd, wr)
         done = 0
@@ -200,20 +210,35 @@ def main(argv=None):
     bp.add_argument("--yes", action="store_true")
     args = ap.parse_args(argv)
 
+    if args.cmd == "burn":
+        # Validate offline before opening BAR0 O_RDWR.
+        loaded = _load_pair(args.plan, args.dump, print)
+        if loaded is None:
+            return 1
+        plan_chk, dump_chk = loaded
+        sim_chk = simulate(dump_chk, plan_chk)
+        if sim_chk["errors"]:
+            for e in sim_chk["errors"]:
+                print("REFUSED: %s" % e)
+            return 1
+
     bdf, mm = open_bar0(args.bdf)
-    r = functools.partial(_rd, mm)
-    w = functools.partial(_wr, mm)
-    print("card at %s" % bdf)
-    if args.cmd == "status":
-        return cmd_status(r)
+    try:
+        r = functools.partial(_rd, mm)
+        w = functools.partial(_wr, mm)
+        print("card at %s" % bdf)
+        if args.cmd == "status":
+            return cmd_status(r)
 
-    def confirm():
-        ans = input("burn %s onto %s? type YES to continue: "
-                    % (args.plan, bdf))
-        return ans.strip() == "YES"
+        def confirm():
+            ans = input("burn %s onto %s? type YES to continue: "
+                        % (args.plan, bdf))
+            return ans.strip() == "YES"
 
-    return cmd_burn(r, w, args.plan, args.dump, rows=args.rows,
-                    force=args.force, confirm=None if args.yes else confirm)
+        return cmd_burn(r, w, args.plan, args.dump, rows=args.rows,
+                        force=args.force, confirm=None if args.yes else confirm)
+    finally:
+        mm.close()
 
 
 if __name__ == "__main__":

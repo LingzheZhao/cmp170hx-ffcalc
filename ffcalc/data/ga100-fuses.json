@@ -21,11 +21,11 @@
     "pcie_devidb":  { "fused": "0x0082056c", "status": null }
   },
   "bit_fields": {
-    "disable_gen3_speed_bit1": { "reg": "0x00820250", "bit": 1 },
-    "disable_gen3_speed_bit9": { "reg": "0x00820250", "bit": 9 },
-    "pcie_magic_gen4_dis":     { "reg": "0x00820520", "bit": 3 },
-    "pcie_boot_gen23_dis":     { "reg": "0x0082057c", "bit": 6 },
-    "pcie_boot_gen3_dis":      { "reg": "0x00820580", "bit": 7 }
+    "disable_gen3_speed_bit1": { "reg": "0x00820250", "bit": 0 },
+    "disable_gen3_speed_bit9": { "reg": "0x00820250", "bit": 0 },
+    "pcie_magic_gen4_dis":     { "reg": "0x00820520", "bit": 25 },
+    "pcie_boot_gen23_dis":     { "reg": "0x0082057c", "bit": 0 },
+    "pcie_boot_gen3_dis":      { "reg": "0x00820580", "bit": 0 }
   },
   "defective": {
     "fbio_defective":   "0x008205d4",

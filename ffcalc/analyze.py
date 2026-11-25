@@ -64,14 +64,13 @@ def resolve_targets(dump, overrides=None):
             targets[f.key] = overrides[f.key]
         elif f.defect_key and f.defect_key in words:
             targets[f.key] = words[f.defect_key]
-        elif f.key in words:
-            targets[f.key] = words[f.key]
-            if f.category != "pcie":
-                warnings.append(
-                    "%s: no %s in dump; assuming current value (no-op)"
-                    % (f.key, f.defect_key))
         elif f.category == "pcie":
             targets[f.key] = 0
+        elif f.key in words:
+            targets[f.key] = words[f.key]
+            warnings.append(
+                "%s: no %s in dump; assuming current value (no-op)"
+                % (f.key, f.defect_key))
         else:
             warnings.append("%s: no value and no defect key; skipped" % f.key)
         if f.key in targets and f.defect_key and f.defect_key in words:

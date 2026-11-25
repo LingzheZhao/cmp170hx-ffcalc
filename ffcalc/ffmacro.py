@@ -63,13 +63,22 @@ def capture_rows(rd, wr, first=0, last=ROW_COUNT - 1,
     or a read timeout; FUSEADDR is restored either way.
     """
     pmc = rd(PMC_BOOT_0)
-    if pmc in (0, 0xffffffff) or (pmc & 0xffff0000) == 0xbadf0000:
+    if pmc in (0, 0xffffffff) or is_poisoned(pmc):
         raise FuseControllerError(
             "PMC_BOOT_0 reads 0x%08x: BAR0 not accessible / GPU off" % pmc)
+    ctrl0 = rd(FUSECTRL)
+    if not is_idle(ctrl0):
+        raise FuseControllerError(
+            "fuse controller %s before capture (FUSECTRL=0x%08x); %s"
+            % ("poisoned" if is_poisoned(ctrl0) else "busy", ctrl0,
+               "stop reads, cold-boot the card"
+               if is_poisoned(ctrl0) else
+               "retry on an idle card or after the active op finishes"))
     orig_addr = rd(FUSEADDR)
     if rows is None:
         rows = {}
     start = clock()
+    ok = False
     try:
         for row in range(first, last + 1):
             if clock() - start > TOTAL_TIMEOUT_S:
@@ -95,22 +104,32 @@ def capture_rows(rd, wr, first=0, last=ROW_COUNT - 1,
                     "FUSEADDR did not latch row %d" % row)
             wr(FUSECTRL, CMD_READ)
             deadline = clock() + PER_ROW_TIMEOUT_S
-            while not is_idle(rd(FUSECTRL)):
+            while True:
+                c = rd(FUSECTRL)
+                if is_idle(c):
+                    break
+                if is_poisoned(c):
+                    raise FuseControllerError(
+                        "controller poisoned during CMD_READ row %d "
+                        "(FUSECTRL=0x%08x): stop reads, cold-boot the card"
+                        % (row, c))
                 if clock() > deadline:
                     raise FuseControllerError(
                         "CMD_READ timeout at row %d (FUSECTRL=0x%08x)"
-                        % (row, rd(FUSECTRL)))
+                        % (row, c))
                 sleep(0)
             rows[row] = rd(FUSEDATA)
+        ok = True
     finally:
-        wr(FUSEADDR, orig_addr)
+        # Never write FUSEADDR after poison, busy, FUSEDEBUG!=0, or timeout.
+        if ok and is_idle(rd(FUSECTRL)):
+            wr(FUSEADDR, orig_addr)
     return rows
 
 
 def is_poisoned(ctrl):
-    """True after a failed command: controller parks at 0xBADFxxxx, state 31,
-    and stops answering further BAR0 reads."""
-    return (ctrl & 0xFFFF0000) == POISON_TAG
+    """True for any NVIDIA PRI error sentinel 0xBAD0xxxx..0xBADFxxxx."""
+    return ((ctrl >> 20) & 0xFFF) == 0xBAD
 
 
 def wait_idle(rd, sleep=time.sleep, clock=time.monotonic, timeout=1.0):
@@ -146,11 +165,12 @@ def in_write_window(st):
 
 
 def read_row(rd, wr, row, sleep=time.sleep, clock=time.monotonic):
-    """One CMD_READ with FUSEADDR restore; blank rows read 0x00000000."""
+    """One CMD_READ with FUSEADDR restore only on clean IDLE completion."""
     if not wait_idle(rd, sleep, clock, PER_ROW_TIMEOUT_S):
         raise FuseControllerError(
             "controller not idle before reading row %d" % row)
     orig = rd(FUSEADDR)
+    ok = False
     try:
         wr(FUSEADDR, row)
         if rd(FUSEADDR) != row:
@@ -158,29 +178,36 @@ def read_row(rd, wr, row, sleep=time.sleep, clock=time.monotonic):
         wr(FUSECTRL, CMD_READ)
         if not wait_idle(rd, sleep, clock, PER_ROW_TIMEOUT_S):
             raise FuseControllerError(
-                "CMD_READ timeout at row %d (FUSECTRL=0x%08x)"
-                % (row, rd(FUSECTRL)))
-        return rd(FUSEDATA)
+                "CMD_READ timeout at row %d (stop, do not read further)" % row)
+        val = rd(FUSEDATA)
+        ok = True
+        return val
     finally:
-        wr(FUSEADDR, orig)
+        if ok:
+            wr(FUSEADDR, orig)
 
 
 def sense(rd, wr, sleep=time.sleep, clock=time.monotonic):
-    """CMD_SENSE: re-read the OTP array into the shadow. Measured safe
-    operation; DSOV must still be 0 afterwards (still inside the window)."""
+    """CMD_SENSE: re-read the OTP array into the shadow. Latches FUSEWDATA=0
+    before issuing CMD_SENSE; DSOV must stay 0 afterwards."""
     if not wait_idle(rd, sleep, clock, PER_ROW_TIMEOUT_S):
         raise FuseControllerError("controller not idle before SENSE")
+    wr(FUSEWDATA, 0)
+    wrb = rd(FUSEWDATA)
+    if wrb != 0:
+        raise FuseControllerError(
+            "FUSEWDATA did not read back 0 before SENSE (0x%08x)" % wrb)
     wr(FUSECTRL, CMD_SENSE)
     sleep(0.2)
     if not wait_idle(rd, sleep, clock, 2.0):
         raise FuseControllerError(
-            "CMD_SENSE did not return to idle (FUSECTRL=0x%08x)"
-            % rd(FUSECTRL))
-    if rd(DSOV_STATUS) != 0:
+            "CMD_SENSE did not return to idle (stop, cold-boot)")
+    dsov = rd(DSOV_STATUS)
+    if is_poisoned(dsov) or dsov != 0:
         raise FuseControllerError(
             "DSOV=0x%x after SENSE: not inside the write window (no PEX_RST "
             "pulse / boot strap set); do NOT arm or program"
-            % rd(DSOV_STATUS))
+            % dsov)
 
 
 def armed_problems(rd, wr):
@@ -264,6 +291,12 @@ static int ffprobe_read_rows(void __iomem *h)
 \tu32 i, orig, c;
 \tint rc = 0;
 
+\tc = readl(h + @FUSECTRL@);
+\tif (!ffprobe_idle(c) || readl(h + @FUSEDEBUG@) != 0) {
+\t\tpr_info("FFPROBE ffrow_error busy_0 %08llx %08x\\n",
+\t\t\t(u64)bar0 + @FUSECTRL@, c);
+\t\treturn -EBUSY;
+\t}
 \torig = readl(h + @FUSEADDR@);
 \tfor (i = 0; i < @ROW_COUNT@; i++) {
 \t\tunsigned long deadline = jiffies + msecs_to_jiffies(200);
@@ -277,21 +310,28 @@ static int ffprobe_read_rows(void __iomem *h)
 \t\t}
 \t\twritel(i, h + @FUSEADDR@);
 \t\twritel(@CMD_READ@, h + @FUSECTRL@);
-\t\twhile (!ffprobe_idle(readl(h + @FUSECTRL@))) {
+\t\tfor (;;) {
+\t\t\tc = readl(h + @FUSECTRL@);
+\t\t\tif (ffprobe_idle(c))
+\t\t\t\tbreak;
+\t\t\tif (((c >> 20) & 0xfffU) == 0xbadU) {
+\t\t\t\tpr_info("FFPROBE ffrow_error poison_%d "
+\t\t\t\t\t"%08llx %08x\\n", i,
+\t\t\t\t\t(u64)bar0 + @FUSECTRL@, c);
+\t\t\t\treturn -EIO;
+\t\t\t}
 \t\t\tif (time_after(jiffies, deadline)) {
 \t\t\t\tpr_info("FFPROBE ffrow_error timeout_%d "
-\t\t\t\t\t"00000000 %08x\\n", i,
-\t\t\t\t\treadl(h + @FUSECTRL@));
-\t\t\t\trc = -ETIMEDOUT;
-\t\t\t\tgoto out;
+\t\t\t\t\t"00000000 %08x\\n", i, c);
+\t\t\t\treturn -ETIMEDOUT;
 \t\t\t}
 \t\t\tudelay(10);
 \t\t}
 \t\tpr_info("FFPROBE ffrow.%d %08llx %08x\\n", i,
 \t\t\t(u64)bar0 + @FUSEDATA@, readl(h + @FUSEDATA@));
 \t}
-out:
-\twritel(orig, h + @FUSEADDR@);
+\tif (rc == 0 && ffprobe_idle(readl(h + @FUSECTRL@)))
+\t\twritel(orig, h + @FUSEADDR@);
 \treturn rc;
 }
 """

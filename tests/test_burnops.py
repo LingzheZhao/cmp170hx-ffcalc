@@ -311,7 +311,7 @@ class TestCaptureSnapshotEndToEnd(unittest.TestCase):
         self.addCleanup(shutil.rmtree, tmp, True)
         base = load_dump(self.SAMPLE)
         ff = dict((r, v) for r, v in base["ff_rows"].items()
-                  if 222 <= r <= 486)
+                  if 222 <= r <= 487)
         card = os.path.join(tmp, "card.json")
         rows = dict(("%d" % r, "0x%08x" % v) for r, v in sorted(ff.items()))
         for r in range(222):        # a capture lists the whole array, so the
@@ -340,6 +340,95 @@ class TestCaptureSnapshotEndToEnd(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertEqual(bar.programs,
                          [(rec["row"], int(rec["record"], 0)) for rec in planned])
+
+
+class TestSafetyHardening(unittest.TestCase):
+    def test_no_fuseaddr_restore_write_on_poison_or_timeout(self):
+        writes = []
+
+        def rd_poison(off):
+            if off == ffmacro.PMC_BOOT_0:
+                return 0x170000A1
+            if off == ffmacro.FUSECTRL:
+                return 0xBAD01234
+            return 0
+
+        def wr_log(off, val):
+            writes.append((off, val))
+
+        with self.assertRaises(ffmacro.FuseControllerError):
+            ffmacro.capture_rows(rd_poison, wr_log, first=222, last=223,
+                                 sleep=noop, clock=zero_clock)
+        self.assertEqual(writes, [], "must not write FUSEADDR when poisoned")
+
+        # Poison during CMD_READ in read_row must not trigger finally wr(FUSEADDR)
+        writes2 = []
+        state = {"ctrl": 0xE0040000, "addr": 0}
+
+        def rd2(off):
+            if off == ffmacro.FUSECTRL:
+                return state["ctrl"]
+            if off == ffmacro.FUSEADDR:
+                return state["addr"]
+            return 0
+
+        def wr2(off, val):
+            writes2.append((off, val))
+            if off == ffmacro.FUSEADDR:
+                state["addr"] = val
+            elif off == ffmacro.FUSECTRL and val == ffmacro.CMD_READ:
+                state["ctrl"] = 0xBADF510E
+
+        with self.assertRaises(ffmacro.FuseControllerError):
+            ffmacro.read_row(rd2, wr2, 222, sleep=noop, clock=zero_clock)
+        # Only writes should be FUSEADDR=222 and FUSECTRL=CMD_READ — NO finally restore!
+        self.assertEqual(writes2, [(ffmacro.FUSEADDR, 222), (ffmacro.FUSECTRL, ffmacro.CMD_READ)])
+
+    def test_capture_rd_wr_single_32bit_memoryview(self):
+        from ffcalc import capture
+        buf = bytearray(0x100)
+        capture.wr(buf, 0x20, 0xCAFEBABE)
+        self.assertEqual(capture.rd(buf, 0x20), 0xCAFEBABE)
+
+    def test_burntool_catches_sense_poison_returning_rc3(self):
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, True)
+        plan_path = os.path.join(tmp, "plan.json")
+        dump_path = os.path.join(tmp, "dump.json")
+        with open(plan_path, "w") as f:
+            json.dump(PLAN, f)
+        rows = dict(("%d" % r, "0") for r in range(512))
+        rows["290"] = "0x429004c1"
+        with open(dump_path, "w") as f:
+            json.dump({"sku": "8gb", "uuid": "GPU-test", "fingerprint": "abc",
+                       "ff_rows": rows,
+                       "option_words": {"fbp_disable": "0x852",
+                                        "fbp_defective": "0x840"}}, f)
+
+        bar = BurnBar(rows={290: 0x429004C1})
+        orig_wr = bar.wr
+
+        def poison_on_sense(off, val):
+            if off == ffmacro.FUSECTRL and (val & 0x1F) == ffmacro.CMD_SENSE:
+                bar.ctrl = 0xBADF510E
+                return
+            orig_wr(off, val)
+
+        bar.wr = poison_on_sense
+        logs = []
+        rc = burntool.cmd_burn(bar.rd, bar.wr, plan_path, dump_path,
+                               sleep=noop, clock=zero_clock, log=logs.append)
+        self.assertEqual(rc, 3)
+        self.assertTrue(any("ABORT:" in m for m in logs))
+
+    def test_pcie_bit_fields_target_zero_even_when_word_reads_one(self):
+        from ffcalc import analyze
+        base = load_dump(TestCaptureSnapshotEndToEnd.SAMPLE)
+        base["option_words"]["pcie_magic_gen4_dis"] = 1
+        base["option_words"]["disable_gen3_speed_bit1"] = 1
+        targets, _ = analyze.resolve_targets(base)
+        self.assertEqual(targets["pcie_magic_gen4_dis"], 0)
+        self.assertEqual(targets["disable_gen3_speed_bit1"], 0)
 
 
 if __name__ == "__main__":

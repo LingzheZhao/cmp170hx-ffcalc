@@ -556,7 +556,7 @@ class TestFfRowsParsing(unittest.TestCase):
         self.assertEqual(ffrows.coverage({"ff_rows": {"0": 5}})[0], "missing")
         self.assertEqual(ffrows.coverage({"ff_rows": {"222": 1}})[0],
                          "partial")
-        full = dict((r, 0) for r in range(222, 487))
+        full = dict((r, 0) for r in range(222, 488))
         self.assertEqual(ffrows.coverage({"ff_rows": full})[0], "complete")
 
 
@@ -623,7 +623,7 @@ class TestMergeffCli(unittest.TestCase):
         # gives the merged rows plus the rows that were already there, as-is.
         rows = load_dump(card)["ff_rows"]
         ff = dict((r, v) for r, v in self.dump["ff_rows"].items()
-                  if 222 <= r <= 486)
+                  if 222 <= r <= 487)
         self.assertEqual(dict((r, rows[r]) for r in ff), ff)
         self.assertEqual(dict((r, rows[r]) for r in outside), outside)
         # Idempotent: the file mergeff wrote is a snapshot mergeff can read
@@ -718,7 +718,7 @@ class TestFfMacro(unittest.TestCase):
                                  clock=lambda: next(clock_times),
                                  rows=out)
         self.assertEqual(out, {})
-        self.assertEqual(bar.addr, 77)  # FUSEADDR restored on failure
+        self.assertEqual(bar.addr, 0)  # FUSEADDR is NOT written back after timeout/error
 
     def test_busy_controller_refuses_to_start(self):
         bar = FakeFuseBar(idle=False)
